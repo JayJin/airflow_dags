@@ -249,17 +249,37 @@ with DAG(
         ext = file_info["ext"]
         
         if ext == "xlsx":
-            print(f"Converting Excel to ANSI CSV: {target_key}")
-            excel_bytes = s3.get_object(Bucket=bucket, Key=target_key)["Body"].read()
-            df = pd.read_excel(io.BytesIO(excel_bytes))
-            output = io.StringIO()
-            df.to_csv(output, index=False, encoding='cp949')
-            csv_bytes = output.getvalue().encode('cp949')
-            
-            csv_key = target_key.replace(".xlsx", ".csv")
-            s3.put_object(Bucket=bucket, Key=csv_key, Body=csv_bytes)
-            print(f"Saved converted CSV to Minio: {csv_key}")
-            return {"csv_key": csv_key, "original_key": target_key, "ext": ext}
+            print(f"Checking Excel file format: {target_key}")
+            try:
+                excel_bytes = s3.get_object(Bucket=bucket, Key=target_key)["Body"].read()
+                
+                # Zip 파일의 매직 넘버(PK\x03\x04)를 확인하여 유효한 .xlsx 파일인지 검증합니다.
+                if not excel_bytes.startswith(b"PK\x03\x04"):
+                    raise ValueError(f"Magic number mismatch for {target_key}")
+
+                # 엑셀 엔진을 명시적으로 지정하여 읽기 시도
+                df = pd.read_excel(io.BytesIO(excel_bytes), engine='openpyxl')
+                output = io.StringIO()
+                df.to_csv(output, index=False, encoding='cp949')
+                csv_bytes = output.getvalue().encode('cp949')
+                
+                csv_key = target_key.replace(".xlsx", ".csv")
+                s3.put_object(Bucket=bucket, Key=csv_key, Body=csv_bytes)
+                print(f"Successfully converted Excel to CSV: {csv_key}")
+                return {"csv_key": csv_key, "original_key": target_key, "ext": ext}
+
+            except Exception as e:
+                print(f"Excel processing failed for {target_key}: {e}")
+                csv_fallback_key = target_key.replace(".xlsx", ".csv")
+                print(f"Looking for fallback CSV: {csv_fallback_key}")
+                
+                try:
+                    s3.head_object(Bucket=bucket, Key=csv_fallback_key)
+                    print(f"Fallback CSV found. Proceeding with: {csv_fallback_key}")
+                    return {"csv_key": csv_fallback_key, "original_key": csv_fallback_key, "ext": "csv"}
+                except:
+                    print(f"No fallback CSV found for {csv_fallback_key}.")
+                    raise e
         else:
             print(f"File is already CSV: {target_key}. Skipping transformation.")
             return {"csv_key": target_key, "original_key": target_key, "ext": ext}
