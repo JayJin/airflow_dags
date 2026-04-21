@@ -15,7 +15,7 @@ from airflow.exceptions import AirflowSkipException
 from airflow.models import Variable
 from airflow.hooks.base import BaseHook
 
-# --- [내부 유틸리티 함수 - 단일 파일 구성을 위해 포함됨] ---
+# --- [내부 유틸리티 함수] ---
 
 # Robust parsing for tags/terms
 _TAG_TOKEN_RE = re.compile(r"\"([^\"]+)\"|'([^']+)'|([^,\s\( \)\"']+)")
@@ -92,26 +92,6 @@ def get_minio_client(conn_id: str):
         aws_secret_access_key=conn.password,
         region_name=extra.get("region_name", "us-east-1")
     )
-
-def find_latest_metadata_file(s3_client, bucket: str) -> Tuple[Optional[str], Optional[str]]:
-    """가장 최신 날짜의 파일을 찾고, xlsx를 csv보다 우선시합니다."""
-    response = s3_client.list_objects_v2(Bucket=bucket, Prefix="update_metadata_")
-    if 'Contents' not in response: return None, None
-        
-    pattern = re.compile(r"update_metadata_(\d{6})\.(csv|xlsx)$")
-    candidates = []
-    for obj in response['Contents']:
-        key = obj['Key']
-        match = pattern.search(key)
-        if match:
-            candidates.append({"key": key, "date": match.group(1), "ext": match.group(2)})
-            
-    if not candidates: return None, None
-        
-    # 날짜 내림차순, 확장자 내림차순 (xlsx > csv)
-    candidates.sort(key=lambda x: (x['date'], x['ext']), reverse=True)
-    best = candidates[0]
-    return best['key'], best['ext']
 
 def ensure_tag_entities(graph, tags: Iterable[str]) -> None:
     from datahub.emitter.mcp import MetadataChangeProposalWrapper
@@ -230,44 +210,83 @@ with DAG(
 ) as dag:
 
     @task
-    def process_metadata_sync() -> None:
+    def check_latest_file() -> dict:
+        """1. Minio 연결 및 최신 소스 파일 탐색"""
         conn_id = "minio_conn"
-        bucket = _var("MINIO_BUCKET", "infoschema")
-        gms_endpoint = _var("DATAHUB_GMS_ENDPOINT", "http://host.docker.internal:8080")
-        env = _var("DATAHUB_ENV", "PROD")
-        archive_processed = (_var("ARCHIVE_PROCESSED", "true") or "").lower() in ("1", "true", "yes", "y")
+        bucket = _var("MINIO_BUCKET", "datahub-infoschema")
         
         s3 = get_minio_client(conn_id)
-        target_key, ext = find_latest_metadata_file(s3, bucket)
+        response = s3.list_objects_v2(Bucket=bucket, Prefix="update_metadata_")
         
-        if not target_key:
+        if 'Contents' not in response:
             raise AirflowSkipException("No metadata files found matching the pattern.")
         
-        # Download and Prepare
+        pattern = re.compile(r"update_metadata_(\d{6})\.(csv|xlsx)$")
+        candidates = []
+        for obj in response['Contents']:
+            key = obj['Key']
+            match = pattern.search(key)
+            if match:
+                candidates.append({"key": key, "date": match.group(1), "ext": match.group(2)})
+        
+        if not candidates:
+            raise AirflowSkipException("No valid candidate files found.")
+            
+        candidates.sort(key=lambda x: (x['date'], x['ext']), reverse=True)
+        best = candidates[0]
+        
+        print(f"Target file identified: {best['key']}")
+        return {"key": best['key'], "ext": best['ext']}
+
+    @task
+    def transform_to_ansi_csv(file_info: dict) -> dict:
+        """2. Excel일 경우 ANSI CSV로 변환 및 Minio 저장 (CSV일 경우 Pass)"""
+        conn_id = "minio_conn"
+        bucket = _var("MINIO_BUCKET", "datahub-infoschema")
+        s3 = get_minio_client(conn_id)
+        
+        target_key = file_info["key"]
+        ext = file_info["ext"]
+        
         if ext == "xlsx":
+            print(f"Converting Excel to ANSI CSV: {target_key}")
             excel_bytes = s3.get_object(Bucket=bucket, Key=target_key)["Body"].read()
             df = pd.read_excel(io.BytesIO(excel_bytes))
             output = io.StringIO()
             df.to_csv(output, index=False, encoding='cp949')
             csv_bytes = output.getvalue().encode('cp949')
-            # Save converted CSV back to MinIO as requested
+            
             csv_key = target_key.replace(".xlsx", ".csv")
             s3.put_object(Bucket=bucket, Key=csv_key, Body=csv_bytes)
-            processing_bytes, source_key = csv_bytes, csv_key
+            print(f"Saved converted CSV to Minio: {csv_key}")
+            return {"csv_key": csv_key, "original_key": target_key, "ext": ext}
         else:
-            processing_bytes = s3.get_object(Bucket=bucket, Key=target_key)["Body"].read()
-            source_key = target_key
+            print(f"File is already CSV: {target_key}. Skipping transformation.")
+            return {"csv_key": target_key, "original_key": target_key, "ext": ext}
 
-        # Decode (ANSI/CP949 preferred for converted Excel, fallback to UTF-8-SIG)
+    @task
+    def sync_to_datahub(process_info: dict) -> None:
+        """3. DataHub에 메타데이터 동기화"""
+        conn_id = "minio_conn"
+        bucket = _var("MINIO_BUCKET", "datahub-infoschema")
+        gms_endpoint = _var("DATAHUB_GMS_ENDPOINT", "http://datahub-gms:8080")
+        env = _var("DATAHUB_ENV", "PROD")
+        
+        s3 = get_minio_client(conn_id)
+        csv_key = process_info["csv_key"]
+        
+        print(f"Fetching CSV data from: {csv_key}")
+        processing_bytes = s3.get_object(Bucket=bucket, Key=csv_key)["Body"].read()
+        
         try: text = processing_bytes.decode("cp949")
         except: text = processing_bytes.decode("utf-8-sig")
 
         reader = csv.DictReader(io.StringIO(text))
         rows = [{(k or "").strip(): (v or "") for k, v in r.items() if k} for r in reader]
         
-        if not rows: raise AirflowSkipException(f"File {source_key} has no valid data.")
+        if not rows:
+            raise AirflowSkipException(f"CSV {csv_key} has no valid data.")
 
-        # DataHub Update
         from datahub.ingestion.graph.client import DatahubClientConfig, DataHubGraph
         graph = DataHubGraph(DatahubClientConfig(server=gms_endpoint))
         
@@ -279,16 +298,55 @@ with DAG(
         for urn, items in by_urn.items():
             update_dataset_in_datahub(graph, urn=urn, row_items=items, env=env)
             
-        print(f"Update complete. Processed {len(by_urn)} datasets.")
+        print(f"Successfully processed {len(by_urn)} datasets to DataHub.")
 
-        # Archive
-        if archive_processed:
-            ts = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
-            s3.copy_object(Bucket=bucket, CopySource={"Bucket": bucket, "Key": target_key}, Key=f"archive/{ts}-{os.path.basename(target_key)}")
-            s3.delete_object(Bucket=bucket, Key=target_key)
-            if ext == "xlsx":
-                csv_key = target_key.replace(".xlsx", ".csv")
-                s3.copy_object(Bucket=bucket, CopySource={"Bucket": bucket, "Key": csv_key}, Key=f"archive/{ts}-gen-{os.path.basename(csv_key)}")
-                s3.delete_object(Bucket=bucket, Key=csv_key)
-
-    process_metadata_sync()
+    @task
+    def archive_and_cleanup(process_info: dict) -> None:
+        """4. 처리 완료된 파일 아카이브 및 정리"""
+        conn_id = "minio_conn"
+        bucket = _var("MINIO_BUCKET", "datahub-infoschema")
+        archive_processed = (_var("ARCHIVE_PROCESSED", "true") or "").lower() in ("1", "true", "yes", "y")
+        
+        if not archive_processed:
+            print("Archive setting disabled. Skipping cleanup.")
+            return
+            
+        s3 = get_minio_client(conn_id)
+        original_key = process_info["original_key"]
+        csv_key = process_info["csv_key"]
+        ext = process_info["ext"]
+        ts = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
+        
+        # Original 파일 보관
+        s3.copy_object(
+            Bucket=bucket, 
+            CopySource={"Bucket": bucket, "Key": original_key}, 
+            Key=f"archive/{ts}-{os.path.basename(original_key)}"
+        )
+        s3.delete_object(Bucket=bucket, Key=original_key)
+        
+        # Excel에서 생성된 CSV가 있다면 추가 보관/정리
+        if ext == "xlsx":
+            s3.copy_object(
+                Bucket=bucket, 
+                CopySource={"Bucket": bucket, "Key": csv_key}, 
+                Key=f"archive/{ts}-gen-{os.path.basename(csv_key)}"
+            )
+            s3.delete_object(Bucket=bucket, Key=csv_key)
+            
+        print(f"Cleanup complete for {original_key}.")
+    
+    # 1. 파일 탐색
+    file_info = check_latest_file()
+    
+    # 2. 형식 변환
+    process_info = transform_to_ansi_csv(file_info)
+    
+    # 3. 데이터 업데이트
+    sync_done = sync_to_datahub(process_info)
+    
+    # 4. 파일 정리 (3단계 업데이트가 성공한 후 파일 아카이브 및 삭제 진행)
+    cleanup_done = archive_and_cleanup(process_info)
+    
+    # 명시적 의존성 연결: 화살표가 순서대로 이어지도록 보장
+    sync_done >> cleanup_done
